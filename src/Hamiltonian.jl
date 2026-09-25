@@ -1,5 +1,5 @@
 module Hams
-    export Hamiltonian , FillHoppingHamiltonian, FillPairingHamiltonian, FillHamiltonian , DiagonalizeHamiltonian! , DOS, ModifyHamiltonianField!, IsBandGapped, GetVelocity!
+    export Hamiltonian , FillHoppingHamiltonian, FillPairingHamiltonian, FillHamiltonian , DiagonalizeHamiltonian! , DOS, ModifyHamiltonianField!, IsBandGapped, GetVelocity!, BondDisplacements, OnSiteBlocks
 
     using ..TightBindingToolkit.Useful: Central_Diff, Arrayfy, DeArrayfy
     using ..TightBindingToolkit.SpinMatrices:SpinMats
@@ -44,6 +44,74 @@ Returns the hopping Hamiltonian at momentum point `k`, corresponding to the bond
     end
 
 
+
+
+
+
+
+#Fills a hamiltonian at given k, with precomputed hopping direction vectors.
+    function FillHoppingHamiltonian(uc::UnitCell{2}, k::Vector{Float64},
+                                deltas::Vector{Vector{Float64}},
+                                onsite::Vector{Matrix{ComplexF64}})
+        ld   = uc.localDim
+        H    = zeros(ComplexF64, ld * length(uc.basis), ld * length(uc.basis))
+
+        for site in eachindex(uc.basis)
+            b = ld*(site-1) + 1
+            @views H[b:b+ld-1, b:b+ld-1] .-= onsite[site]
+        end
+
+        for (n, bond) in enumerate(uc.bonds)
+            b1 = ld*(bond.base   - 1) + 1
+            b2 = ld*(bond.target - 1) + 1
+            r1, r2 = b1:b1+ld-1, b2:b2+ld-1
+
+            if b1 == b2 && all(iszero, bond.offset)
+                @views H[r1, r2] .+= (bond.mat .+ bond.mat') ./ 2
+            else
+                ph = cis(dot(k, deltas[n]))
+                @views H[r1, r2] .+= ph .* bond.mat
+                @views H[r2, r1] .+= conj(ph) .* bond.mat'
+            end
+        end
+        return H
+    end
+
+
+    #Real-space displacement of each bond — k-independent, hoisted out of the momentum loop.
+    function BondDisplacements(uc::UnitCell{2}) :: Vector{Vector{Float64}}
+        return Vector{Float64}[sum(b.offset .* uc.primitives) for b in uc.bonds]
+    end
+
+#On-site field contribution per sublattice — also k-independent.
+    function OnSiteBlocks(uc::UnitCell{2}) :: Vector{Matrix{ComplexF64}}
+        return Matrix{ComplexF64}[sum(uc.fields[s] .* uc.OnSiteMats) for s in eachindex(uc.basis)]
+    end
+
+@doc raw"""
+```julia
+FillHamiltonian(uc::UnitCell, bz::BZ) --> Matrix{Matrix{ComplexF64}}
+```
+Returns the full Hamiltonian at all momentum points in `BZ`, corresponding to the bonds present in `UnitCell`.
+
+"""
+
+
+#Fills the brillouin zone of hopping Hamiltonian with precomputed stuff
+    function FillHamiltonian(uc::UnitCell{2}, bz::BZ)
+        deltas = BondDisplacements(uc) #Vector{Float64}[sum(b.offset .* uc.primitives) for b in uc.bonds]
+        onsite = OnSiteBlocks(uc)  #Matrix{ComplexF64}[sum(uc.fields[s] .* uc.OnSiteMats) for s in eachindex(uc.basis)]
+        return map(k -> FillHoppingHamiltonian(uc, k, deltas, onsite), bz.ks)
+    end
+
+
+#Remove previous inefficient way of filling Brillouin zone Hamiltonians 
+#    function FillHamiltonian(uc::UnitCell{2}, bz::BZ)
+        
+#        return FillHoppingHamiltonian.(Ref(uc), bz.ks)
+#    end
+
+
 @doc """
 ```julia
 FillPairingHamiltonian(uc::UnitCell, k::Vector{Float64}) --> Matrix{ComplexF64}
@@ -66,14 +134,59 @@ Returns the pairing Hamiltonian at momentum point `k`, corresponding to the bond
         return H
     end
 
+    #Fills a pairing hamiltonian at given k, with precomputed hopping direction vectors.
+    function FillPairingHamiltonian(uc::UnitCell{2}, k::Vector{Float64},
+                                    deltas::Vector{Vector{Float64}}) :: Matrix{ComplexF64}
+        @assert length(deltas) == length(uc.bonds)
+        ld = uc.localDim
+        H  = zeros(ComplexF64, ld * length(uc.basis), ld * length(uc.basis))
 
-@doc raw"""
-```julia
-FullHamiltonian(uc::UnitCell, bz::BZ) --> Matrix{Matrix{ComplexF64}}
-```
-Returns the full Hamiltonian at all momentum points in `BZ`, corresponding to the bonds present in `UnitCell`.
+        @inbounds for (n, bond) in enumerate(uc.bonds)
+            b1 = ld*(bond.base   - 1) + 1
+            b2 = ld*(bond.target - 1) + 1
+            r1, r2 = b1:b1+ld-1, b2:b2+ld-1
 
-"""
+            ph = cis(dot(k, deltas[n]))
+            @views H[r1, r2] .+= ph .* bond.mat
+        end
+        return H
+    end
+
+    #Fills the Brillouin zone of BdG Hamiltonians with precomputed hopping direction vectors.
+#T(-k) and P(-k) are obtained by negating the displacements, since
+#cis(dot(k, -delta)) == cis(dot(-k, delta)).
+    function FillHamiltonian(uc_hop::UnitCell{2}, uc_pair::UnitCell{2}, bz::BZ)
+
+        @assert IsSameUnitCell(uc_hop, uc_pair) "Inconsistent unit cells for hopping and pairing!"
+
+        dHop    =   BondDisplacements(uc_hop)
+        dPair   =   BondDisplacements(uc_pair)
+        onsite  =   OnSiteBlocks(uc_hop)
+
+        #Deal with minus momentum by setting deltas to be minus instead of k. That should not affect anything, but reduces the number of functions we define in our code
+        mdHop   =   Vector{Float64}[-δ for δ in dHop]
+        mdPair  =   Vector{Float64}[-δ for δ in dPair]
+
+        d       =   uc_hop.localDim * length(uc_hop.basis)
+
+        return map(bz.ks) do k
+
+            Tk      =   FillHoppingHamiltonian(uc_hop, k, dHop,  onsite)
+            Tmk     =   FillHoppingHamiltonian(uc_hop, k, mdHop, onsite)
+            Δk      =   FillPairingHamiltonian(uc_pair, k, dPair) - transpose(FillPairingHamiltonian(uc_pair, k, mdPair))
+
+            ##### The full BdG Hamiltonian in the nambu basis, written block-wise.
+            Hk      =   zeros(ComplexF64, 2d, 2d)
+            @views Hk[1:d,    1:d   ] .=   Tk
+            @views Hk[1:d,    d+1:2d] .=   Δk
+            @views Hk[d+1:2d, 1:d   ] .=   adjoint(Δk)
+            @views Hk[d+1:2d, d+1:2d] .= .-transpose(Tmk)
+
+            return Hk
+        end
+    end
+
+    #This function is not really neede now, but I guess I will not comment it out for now
     function FillHamiltonian(uc_hop::UnitCell{2}, uc_pair::UnitCell{2}, k::Vector{Float64}) :: Matrix{ComplexF64}
 
         @assert IsSameUnitCell(uc_hop, uc_pair) "Inconsistent unit cells for hopping and pairing!"
@@ -88,15 +201,12 @@ Returns the full Hamiltonian at all momentum points in `BZ`, corresponding to th
         return (Hk)
     end
 
-    function FillHamiltonian(uc::UnitCell{2}, bz::BZ)
-        
-        return FillHoppingHamiltonian.(Ref(uc), bz.ks)
-    end
-    
-    function FillHamiltonian(uc_hop::UnitCell{2}, uc_pair::UnitCell{2}, bz::BZ)
 
-        return FillHamiltonian.(Ref(uc_hop), Ref(uc_pair), bz.ks)
-    end
+    
+#    function FillHamiltonian(uc_hop::UnitCell{2}, uc_pair::UnitCell{2}, bz::BZ)
+#        return FillHamiltonian.(Ref(uc_hop), Ref(uc_pair), bz.ks)
+#    end
+
 
 
 @doc """
